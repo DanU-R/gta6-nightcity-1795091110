@@ -1,148 +1,182 @@
-// Procedural city: a grid of blocks separated by roads, each block filled with one or
-// more rectangular buildings with varied colours and "heights" (drawn as a lighter roof).
-// Everything is derived from the seeded RNG so a seed always yields the same city, and the
-// same layout can be rebuilt for the simulation and for rendering.
-import { CITY, CELL, WORLD, PALETTE } from './config.js';
-import { int, pick, range } from './random.js';
+// The city: a deterministic grid of blocks separated by two-lane roads, generated from the
+// seeded RNG once at boot. Each block holds a set of buildings (axis-aligned rectangles with a
+// colour, a pseudo-3D height for the shadow and a window pattern) plus optional decoration
+// (trees, streetlights, a parking lot or a pocket park). Everything is laid out so the renderer
+// can draw it with a couple of camera-visible-range filters and nothing allocates per frame.
+import { BLOCK_PITCH, CITY, ROAD_LANES, blockInner, roadStart } from './config.js';
+
+/** A small integer hash -> 0..1, deterministic, for picking colours without storing them. */
+function hash01(n) {
+  let x = (n ^ 0x9e3779b9) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x85ebca6b) >>> 0;
+  x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35) >>> 0;
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
+
+const BUILDING_COLORS = [
+  { face: '#8fa8c8', top: '#a9bfda', trim: '#6d87a8' },
+  { face: '#c8a88f', top: '#e0c2a7', trim: '#a88a6d' },
+  { face: '#9db89a', top: '#b8cfb4', trim: '#7d9a79' },
+  { face: '#c49a9a', top: '#ddb4b4', trim: '#a67a7a' },
+  { face: '#b0a4c8', top: '#c8bde0', trim: '#8c7fa8' },
+  { face: '#d8c88f', top: '#eee0a8', trim: '#b4a46d' },
+  { face: '#8fb8c0', top: '#aad2d8', trim: '#6d96a0' },
+  { face: '#c8b89a', top: '#ded0b4', trim: '#a8987a' },
+];
+
+/** Split [0,size] into 1..n parts with random-ish but balanced lengths. */
+function splitSpan(random, start, size, maxParts, minLen) {
+  const parts = [];
+  let cursor = start;
+  let remaining = size;
+  let guard = 0;
+  while (remaining > minLen * 1.5 && parts.length < maxParts && guard < 40) {
+    guard += 1;
+    const want = minLen + random() * (remaining - minLen);
+    const take = Math.min(remaining - minLen, want);
+    if (take < minLen) break;
+    parts.push({ a: cursor, len: take });
+    cursor += take;
+    remaining -= take;
+    // occasionally leave a small alley gap
+    if (remaining > minLen * 2 && random() < 0.18) {
+      const gap = 12 + random() * 22;
+      cursor += gap;
+      remaining -= gap;
+    }
+  }
+  if (remaining > 4) parts.push({ a: cursor, len: remaining });
+  return parts;
+}
+
+function makeBuilding(random, x, y, w, h) {
+  const palette = BUILDING_COLORS[Math.floor(random() * BUILDING_COLORS.length)];
+  // Height in "floors" -> a longer shadow and a brighter top face.
+  const floors = 1 + Math.floor(random() * 4);
+  return {
+    x, y, w, h,
+    face: palette.face,
+    top: palette.top,
+    trim: palette.trim,
+    floors,
+    // window grid density
+    winCols: Math.max(1, Math.floor(w / 46)),
+    winRows: Math.max(1, Math.floor(h / 46)),
+    lit: random(),
+  };
+}
 
 /**
- * Build the city for a given RNG. Returns:
- *   buildings: [{ x, y, w, h, color, roof, windows }]  — solid rectangles in world space
- *   blocks:    [{ x, y, w, h }]                          — sidewalk areas (for peds / greenery)
- *   roads:     { xs: [x...], ys: [y...], centers }       — road centre lines and widths
- *   roadRects: [{ x, y, w, h, vertical }]                — drivable road rectangles
- *   isRoad(x, y): boolean                                — point test against road rects
+ * Build the whole city. Returns:
+ *   roads        : [{k, vertical, base, lanes:[c1,c2]}] the centre-lines, for traffic + minimap
+ *   buildings    : every building rect (collision + render)
+ *   blocks       : per-block decoration lists {trees, lamps, parks, lots}
+ *   intersections: [{x,y}] road crossings, for traffic lights
  */
-export function createCity(random) {
+export function generateCity(random) {
+  const roads = [];
+  for (let k = 0; k <= CITY.blocks; k += 1) {
+    const base = roadStart(k);
+    const lanes = [base + CITY.roadWidth / 2 - ROAD_LANES / 2, base + CITY.roadWidth / 2 + ROAD_LANES / 2];
+    roads.push({ k, vertical: true, base, lanes });
+    roads.push({ k, vertical: false, base, lanes });
+  }
+
   const buildings = [];
   const blocks = [];
-  const roadXs = [];
-  const roadYs = [];
-  const roadRects = [];
+  const intersections = [];
+  const n = CITY.blocks;
 
-  const { cols, rows, block, road, margin } = CITY;
+  for (let bi = 0; bi < n; bi += 1) {
+    for (let bj = 0; bj < n; bj += 1) {
+      const ix = blockInner(bi);
+      const iy = blockInner(bj);
+      const size = CITY.blockSize;
+      const inner = { x: ix, y: iy, w: size, h: size };
+      const block = {
+        x: ix, y: iy, w: size, h: size,
+        trees: [], lamps: [], parks: [], lots: [], buildings: [],
+      };
 
-  // Vertical roads run between block columns; horizontal between block rows. A road of
-  // width `road` sits at each cell boundary. World origin is margin + half a road in.
-  for (let c = 0; c <= cols; c++) {
-    const x = margin + c * CELL;
-    roadXs.push(x + road / 2);
-    roadRects.push({ x, y: margin, w: road, h: rows * CELL + road, vertical: true });
-  }
-  for (let r = 0; r <= rows; r++) {
-    const y = margin + r * CELL;
-    roadYs.push(y + road / 2);
-    roadRects.push({ x: margin, y, w: cols * CELL + road, h: road, vertical: false });
-  }
-
-  // Each block: a sidewalk pad with 1-4 buildings inside it.
-  for (let c = 0; c < cols; c++) {
-    for (let r = 0; r < rows; r++) {
-      const bx = margin + road + c * CELL;
-      const by = margin + road + r * CELL;
-      const pad = 10; // sidewalk width around buildings
-      blocks.push({ x: bx, y: by, w: block, h: block });
-
-      // Decide how to split the block into 1-4 lots.
-      const split = int(random, 1, 3); // 1 => one big, 2 => halves, 3 => quarters
-      const inner = { x: bx + pad, y: by + pad, w: block - pad * 2, h: block - pad * 2 };
-      const lots = [];
-      if (split === 1) {
-        lots.push(inner);
-      } else if (split === 2) {
-        if (random() < 0.5) {
-          const w = inner.w / 2 - 4;
-          lots.push({ x: inner.x, y: inner.y, w, h: inner.h });
-          lots.push({ x: inner.x + w + 8, y: inner.y, w: inner.w - w - 8, h: inner.h });
-        } else {
-          const h = inner.h / 2 - 4;
-          lots.push({ x: inner.x, y: inner.y, w: inner.w, h });
-          lots.push({ x: inner.x, y: inner.y + h + 8, w: inner.w, h: inner.h - h - 8 });
+      // Choose a block "type" deterministically from its coordinates.
+      const kind = hash01(bi * 71 + bj * 131 + 7);
+      if (kind < 0.14) {
+        // Pocket park: grass with a scattering of trees and a path.
+        block.parks.push({ x: ix, y: iy, w: size, h: size });
+        const treeCount = 6 + Math.floor(hash01(bi * 13 + bj * 7) * 8);
+        for (let t = 0; t < treeCount; t += 1) {
+          block.trees.push({
+            x: ix + 30 + hash01(bi * 991 + bj * 37 + t * 17) * (size - 60),
+            y: iy + 30 + hash01(bi * 53 + bj * 911 + t * 29) * (size - 60),
+            r: 16 + hash01(t * 101 + bi * 3 + bj) * 14,
+          });
+        }
+        // benches / path lamps
+        for (let l = 0; l < 3; l += 1) {
+          block.lamps.push({
+            x: ix + 40 + hash01(bi + bj * 5 + l) * (size - 80),
+            y: iy + 40 + hash01(bi * 3 + bj + l) * (size - 80),
+          });
+        }
+      } else if (kind < 0.26) {
+        // Parking lot: dark asphalt with painted bays.
+        block.lots.push({ x: ix, y: iy, w: size, h: size });
+        for (let l = 0; l < 4; l += 1) {
+          block.lamps.push({
+            x: ix + 50 + l * (size - 100) / 3,
+            y: iy + 30,
+          });
         }
       } else {
-        const w = inner.w / 2 - 4;
-        const h = inner.h / 2 - 4;
-        lots.push({ x: inner.x, y: inner.y, w, h });
-        lots.push({ x: inner.x + w + 8, y: inner.y, w: inner.w - w - 8, h });
-        lots.push({ x: inner.x, y: inner.y + h + 8, w, h: inner.h - h - 8 });
-        lots.push({ x: inner.x + w + 8, y: inner.y + h + 8, w: inner.w - w - 8, h: inner.h - h - 8 });
-      }
-
-      for (const lot of lots) {
-        // Occasionally leave a lot empty (a small park / parking area).
-        if (random() < 0.12) continue;
-        const inset = range(random, 2, 8);
-        const w = lot.w - inset * 2;
-        const h = lot.h - inset * 2;
-        if (w < 30 || h < 30) continue;
-        const color = pick(random, PALETTE.building);
-        const roof = pick(random, PALETTE.buildingTop);
-        // Window grid derived deterministically from size.
-        const windows = [];
-        const cols2 = Math.max(1, Math.floor(w / 26));
-        const rows2 = Math.max(1, Math.floor(h / 26));
-        for (let wy = 0; wy < rows2; wy++) {
-          for (let wx = 0; wx < cols2; wx++) {
-            if (random() < 0.55) {
-              windows.push({
-                x: lot.x + inset + 8 + wx * ((w - 16) / cols2),
-                y: lot.y + inset + 8 + wy * ((h - 16) / rows2),
-              });
+        // Built-up block: subdivide into 1..6 buildings.
+        const cols = splitSpan(random, ix + 8, size - 16, 3, 120);
+        for (const col of cols) {
+          const rows = splitSpan(random, iy + 8, size - 16, 3, 120);
+          for (const row of rows) {
+            // Leave a small setback.
+            const pad = 6 + random() * 10;
+            const b = makeBuilding(
+              random,
+              col.a + pad, row.a + pad,
+              col.len - pad * 2, row.len - pad * 2,
+            );
+            if (b.w > 30 && b.h > 30) {
+              buildings.push(b);
+              block.buildings.push(b);
             }
           }
         }
-        buildings.push({
-          x: lot.x + inset,
-          y: lot.y + inset,
-          w,
-          h,
-          color,
-          roof,
-          windows,
-        });
+        // Street trees along the block edges.
+        const treeCount = 1 + Math.floor(random() * 3);
+        for (let t = 0; t < treeCount; t += 1) {
+          block.trees.push({
+            x: ix - 10 + random() * (size + 20),
+            y: iy - 10 + random() * (size + 20),
+            r: 15 + random() * 10,
+          });
+        }
+        // A lamp at the corner.
+        block.lamps.push({ x: ix - 14, y: iy - 14 });
+      }
+
+      blocks.push(block);
+
+      // Intersection lights at each corner of this block.
+      for (const [ox, oy] of [
+        [0, 0], [BLOCK_PITCH, 0], [0, BLOCK_PITCH], [BLOCK_PITCH, BLOCK_PITCH],
+      ]) {
+        intersections.push({ x: roadStart(bi) + ox + CITY.roadWidth / 2, y: roadStart(bj) + oy + CITY.roadWidth / 2 });
       }
     }
   }
 
-  function isRoad(x, y) {
-    // Inside the drivable area?
-    if (x < margin || y < margin || x > WORLD.width - margin || y > WORLD.height - margin) return false;
-    // On a vertical road?
-    for (let c = 0; c <= cols; c++) {
-      const rx = margin + c * CELL;
-      if (x >= rx && x <= rx + road) return true;
-    }
-    for (let r = 0; r <= rows; r++) {
-      const ry = margin + r * CELL;
-      if (y >= ry && y <= ry + road) return true;
-    }
-    return false;
+  // De-duplicate intersections (shared corners).
+  const seen = new Set();
+  const uniq = [];
+  for (const p of intersections) {
+    const key = `${Math.round(p.x)},${Math.round(p.y)}`;
+    if (!seen.has(key)) { seen.add(key); uniq.push(p); }
   }
 
-  return { buildings, blocks, roadXs, roadYs, roadRects, isRoad };
-}
-
-/** Axis-aligned overlap test between two rects {x,y,w,h}. */
-export function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
-  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
-}
-
-/** True if a circle at (x,y) radius r intersects any building rect. */
-export function circleHitsBuildings(city, x, y, r) {
-  for (let i = 0; i < city.buildings.length; i++) {
-    const b = city.buildings[i];
-    // Closest point on rect to circle centre.
-    const cx = Math.max(b.x, Math.min(x, b.x + b.w));
-    const cy = Math.max(b.y, Math.min(y, b.y + b.h));
-    const dx = x - cx;
-    const dy = y - cy;
-    if (dx * dx + dy * dy < r * r) return b;
-  }
-  return null;
-}
-
-/** True if an oriented-ish box (approximated by its bounding circle) hits a building. */
-export function boxHitsBuildings(city, x, y, halfLen, halfWid) {
-  const r = Math.sqrt(halfLen * halfLen + halfWid * halfWid);
-  return circleHitsBuildings(city, x, y, r) !== null;
+  return { roads, buildings, blocks, intersections: uniq };
 }
