@@ -1,142 +1,169 @@
-// Every tuning number and colour in one place. The world is a large grid city; the
-// renderer draws a camera window onto it. All distances are in world pixels.
+// Every tuning number and colour in one place. The playfield is a fixed 1280x720 logical
+// area; the renderer scales it to the window, so no rule here depends on the screen size.
 
-// Logical render size: the camera viewport the renderer scales to the window.
 export const VIEW = { width: 1280, height: 720 };
 
 /** The simulation's fixed step, in seconds: 60 updates a second whatever the display's rate. */
 export const STEP = 1 / 60;
 
-// ---- City layout ---------------------------------------------------------
-// The city is a grid of blocks separated by roads. One "cell" is a city block plus
-// the road that borders it. Roads run along cell boundaries.
+/** The city grid: blocks are square, separated by two-lane roads with sidewalks. */
 export const CITY = {
-  cols: 14,            // blocks across
-  rows: 14,            // blocks down
-  block: 220,          // block (buildings + sidewalk) size in px
-  road: 90,            // road width in px (also the gap between blocks)
-  margin: 120,         // empty border around the whole city
-};
-// A cell = block + road. World coordinate of cell (i,j)'s top-left block corner.
-export const CELL = CITY.block + CITY.road;
-export const WORLD = {
-  width: CITY.cols * CELL + CITY.road + CITY.margin * 2,
-  height: CITY.rows * CELL + CITY.road + CITY.margin * 2,
+  blocks: 9,          // blocks per side
+  blockSize: 520,     // buildable square, each side
+  roadWidth: 132,     // asphalt width (two lanes + markings)
+  sidewalk: 46,       // sidewalk ring around each block
+  size: 0,            // filled in below: full world extent
 };
 
-// ---- Player on foot ------------------------------------------------------
+/** Pitch from one block origin to the next. */
+export const BLOCK_PITCH = CITY.blockSize + CITY.roadWidth;
+/** Full city extent in pixels (blocks * pitch + one trailing road). */
+CITY.size = CITY.blocks * BLOCK_PITCH + CITY.roadWidth;
+export const ROAD_LANES = 30; // half-width of one lane
+
+/** Centre-line positions for a road band starting at `base`: two 30px lanes. */
+export function laneCenters(base) {
+  const c = base + CITY.roadWidth / 2;
+  return [c - ROAD_LANES / 2, c + ROAD_LANES / 2];
+}
+
+/** World coordinate where road band k (k in 0..blocks) starts, on either axis. */
+export const roadStart = (k) => k * BLOCK_PITCH;
+
+/** Block k's inner buildable origin (inside its sidewalk ring), on either axis. */
+export const blockInner = (k) => k * BLOCK_PITCH + CITY.roadWidth + CITY.sidewalk;
+
 export const PLAYER = {
-  radius: 12,
-  speed: 190,
-  maxHealth: 100,
-  fireCooldown: 0.22,
-  bulletSpeed: 900,
-  bulletLife: 0.7,
+  radius: 13,
+  speed: 230,
+  sprint: 1.45,
+  health: 100,
+  fireRate: 0.14,      // seconds between shots
 };
 
-// ---- Cars ----------------------------------------------------------------
 export const CAR = {
-  width: 46,
-  height: 26,
-  maxSpeed: 520,
-  accel: 420,
-  brake: 640,
-  reverseSpeed: 180,
-  turnRate: 2.6,        // radians/sec at full grip
-  friction: 0.9,        // velocity retained per 1/60 when coasting
-  grip: 6,              // how fast velocity aligns to heading
-  enterRadius: 60,
+  length: 64,
+  width: 32,
+  maxSpeed: 430,
+  reverseSpeed: 150,
+  accel: 330,
+  brake: 520,
+  drag: 120,
+  grip: 0.86,          // lateral velocity retained per step (lower = grippier)
+  turnRate: 2.6,       // rad/sec at full speed
+  bulletDamage: 14,
+  ramDamage: 26,
 };
 
 export const TRAFFIC = {
-  count: 26,
-  speed: 150,
+  count: 22,
+  maxSpeed: 180,
+  speedVariance: 70,
 };
 
 export const PED = {
-  count: 40,
-  radius: 10,
-  speed: 60,
-  fleeSpeed: 150,
-  fleeRadius: 220,
+  count: 34,
+  walkSpeed: 62,
+  panicSpeed: 165,
+  panicRadius: 230,
+  panicTime: 3.5,
 };
 
 export const POLICE = {
-  spawnRadius: 1400,    // spawn just off-screen relative to player
-  chaseSpeed: 360,
-  ramSpeed: 480,
-  bustRadius: 46,       // within this of a stopped player on foot -> busted
-  bustTime: 2.2,        // seconds a cop must stay close to bust
+  spawnPerStar: 1,     // one cruiser per wanted star
+  speed: 300,
+  maxSpeed: 380,
+  accel: 260,
+  turnRate: 2.4,
+  bustRadius: 60,      // on-foot distance to bust
+  bustTime: 1.6,       // seconds in range to be busted
+  boxDistance: 150,    // cars must be within this to count as boxing
+  boxTime: 2.4,
 };
 
-// ---- Wanted level --------------------------------------------------------
 export const WANTED = {
   max: 5,
-  decayDelay: 9,        // seconds crime-free before decay starts
-  decayRate: 0.28,      // stars per second once decaying
-  thresholds: [0, 1, 2, 3, 4, 5], // heat value -> star count
+  decayDelay: 9,       // seconds without crime before stars begin to fade
+  decayEvery: 5,       // seconds per star lost
 };
+
+export const BULLET = {
+  speed: 1500,
+  life: 0.75,
+  damage: 34,
+};
+
+export const WORLD = {
+  trafficLightPeriod: 11,
+};
+
+/** localStorage key for cash + mission progress. */
+export const SAVE_KEY = 'neon-syndicate.save';
 
 export const MISSIONS = [
   {
-    id: 'warmup',
-    title: 'A Fresh Start',
-    brief: ['Welcome to Port Meridian.', 'Grab any parked car and drive it', 'to the marker across town.'],
-    target: 'car',          // objective type
+    id: 0,
+    title: 'Warm Welcome',
+    brief: 'A rival crew is muscling in. Take their wheelman off the board.',
+    objective: 'Reach the red marker',
+    target: { x: 3.2, y: 1.4 },   // in block units
     reward: 500,
-    story: 'Word on the street is you can handle yourself. Prove it.',
+    next: 'Steal any car and lose the heat',
   },
   {
-    id: 'heat',
-    title: 'Losing the Heat',
-    brief: ['The cops noticed that stunt.', 'Lose your wanted level: reach the', 'safehouse and lay low.'],
-    target: 'safehouse',
-    reward: 1200,
-    story: 'Keep your head down until the stars fade. Then we talk business.',
+    id: 1,
+    title: 'Grand Theft Auto',
+    brief: 'Boost a fresh ride and shake the cops. Keep it clean.',
+    objective: 'Steal a car and escape the police',
+    reward: 900,
+    next: 'Collect the briefcase across town',
   },
   {
-    id: 'score',
-    title: 'The Big Score',
-    brief: ['One last job. Reach the docks', 'marker and hold out against the', 'heat coming your way.'],
-    target: 'survive',
-    reward: 2500,
-    story: 'The docks. Get there, survive the response, and you are made.',
+    id: 2,
+    title: 'Special Delivery',
+    brief: 'A briefcase of cash is waiting downtown. Go get it.',
+    objective: 'Reach the green marker',
+    target: { x: 6.8, y: 6.4 },
+    reward: 1600,
+    next: null,
   },
 ];
 
-// ---- Palette -------------------------------------------------------------
 export const PALETTE = {
-  backdrop: '#0b0e14',
-  grass: '#22331f',
-  grassAlt: '#263a22',
-  road: '#2b2f38',
-  roadLine: '#c9a84a',
-  sidewalk: '#4a4f5a',
-  lane: '#3a3f49',
-  building: ['#5b6b7a', '#6d5a52', '#52604f', '#66566b', '#4a5568', '#705c4e'],
-  buildingTop: ['#73859a', '#857067', '#68796a', '#7f6d87', '#5f6d85', '#8a7060'],
-  window: '#ffe08a',
-  playerBody: '#3ad0e0',
-  playerHead: '#e8c9a0',
-  copBody: '#2b3a67',
-  copLight: '#ff3b3b',
-  copLight2: '#3b6bff',
-  carColors: ['#c94f4f', '#4f79c9', '#c9a84f', '#4fc98a', '#c96fc9', '#cfd4da', '#e07b39'],
-  policeCar: '#1c2742',
-  marker: '#ffd23f',
-  markerOk: '#4fd07a',
-  hudBg: 'rgba(12,16,24,0.82)',
-  hudText: '#eef2f7',
-  hudMuted: '#9aa4b4',
-  star: '#ffd23f',
-  starOff: 'rgba(255,210,63,0.22)',
-  danger: '#ff4d4d',
-  cash: '#4fd07a',
-  health: '#4fd07a',
-  healthLow: '#ff5a5a',
+  backdrop: '#0c1020',
+  asphalt: '#3a3f52',
+  asphaltDark: '#33384a',
+  laneLine: '#f4d35e',
+  laneDash: '#e9edf5',
+  sidewalk: '#b9bec9',
+  sidewalkEdge: '#9aa0ad',
+  grass: '#5fae5f',
+  grassDark: '#4d9a4d',
+  tree: '#2f7d3a',
+  treeDark: '#276730',
+  trunk: '#6b4a2f',
+  buildingShadow: 'rgba(20, 24, 40, 0.22)',
+  roadGlow: 'rgba(255, 214, 110, 0.55)',
+  policeRed: '#ff3b5c',
+  policeBlue: '#2f6bff',
+  policeBody: '#20242f',
+  player: '#4fd0e0',
+  playerDark: '#2b9aa8',
+  ped: ['#e85d75', '#f2a541', '#4fb3e8', '#8e6fd4', '#5fcf80', '#ef7bb0', '#d8d8d8'],
+  carColors: ['#e05263', '#f2a541', '#4fb3e8', '#7dc35a', '#b07de0', '#e8e8e8', '#4a4a58', '#2f8f9a'],
+  policeLight: '#ffd34d',
+  muzzle: '#ffe08a',
+  tracer: '#ffd34d',
+  wanted: '#ffd23f',
+  wantedEmpty: 'rgba(255,255,255,0.18)',
+  health: '#4fd36b',
+  healthLow: '#ff5a4f',
+  cash: '#5fe08a',
+  white: '#ffffff',
+  panel: 'rgba(16, 20, 34, 0.82)',
+  panelEdge: 'rgba(255,255,255,0.10)',
+  shadow: 'rgba(10, 12, 22, 0.35)',
 };
 
 export const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
-
-/** localStorage keys. */
-export const SAVE_KEY = 'port-meridian.save.v1';
+export const DISPLAY_FONT = '"Arial Black", "Segoe UI", system-ui, sans-serif';
